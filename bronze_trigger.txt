@@ -1,0 +1,30 @@
+添加 EventBridge 定时触发器
+请按照以下步骤为你的 IngestWeatherLambda 添加“闹钟”：
+
+进入 Lambda 控制台：找到你的 Bronze 层函数（例如 IngestWeatherLambda）。
+
+添加触发器：
+
+在函数设计图（Function Overview）的左侧，点击 + Add trigger。
+
+选择源：
+
+在下拉菜单中搜索并选择 EventBridge (CloudWatch Events)。
+
+配置规则：
+
+Rule: 选择 Create a new rule。
+
+Rule name: 输入例如 Every15Minutes。
+
+Rule description: 输入 Trigger weather ingestion every 15 mins。
+
+Rule type: 选择 Schedule expression。
+
+编写表达式：
+
+在 Schedule expression 中输入：rate(15 minutes)
+
+(或者使用 Cron 表达式: cron(0/15 * * * ? *))
+
+保存：点击 Add。
