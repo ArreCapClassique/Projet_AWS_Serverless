@@ -1,0 +1,393 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Academy Lab: Weather Pipeline (Medallion + Dashboard + Step Functions) - STABLE VERSION'
+
+Parameters:
+  LabRoleName:
+    Type: String
+    Default: 'LabRole'
+    Description: 'The name of the existing IAM Role to use.'
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+
+Resources:
+  # ============================================================================
+  # 1. S3 Bucket
+  # ============================================================================
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: TransformationPermission
+    Properties:
+      BucketName: !Sub 'meteo-project-${AWS::AccountId}-${AWS::Region}'
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt TransformationFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: bronze/
+                  - Name: suffix
+                    Value: .json
+
+  # ============================================================================
+  # 2. Ingestion (Bronze)
+  # ============================================================================
+  IngestionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: WeatherIngestion
+      Handler: index.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}'
+      Runtime: python3.12
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataBucket
+      Code:
+        ZipFile: |
+          import json, urllib.request, boto3, os, datetime
+          LAYER_PREFIX = "bronze" 
+          RAW_BUCKET = os.environ.get("BUCKET_NAME")
+          API_URL = "https://data.toulouse-metropole.fr/api/explore/v2.1/catalog/datasets/42-station-meteo-toulouse-parc-compans-cafarelli/records?limit=1&order_by=heure_utc%20desc"
+
+          def lambda_handler(event, context):
+              s3 = boto3.client("s3")
+              try:
+                  with urllib.request.urlopen(API_URL) as resp:
+                      if resp.getcode() != 200: return {"statusCode": 500}
+                      data = json.loads(resp.read().decode("utf-8"))
+                  results = data.get("results") or []
+                  if not results: return {"statusCode": 204}
+                  record = results[0]
+                  
+                  raw_ts = record.get("heure_utc")
+                  if raw_ts:
+                      yyyy, mm, dd = raw_ts[0:4], raw_ts[5:7], raw_ts[8:10]
+                      safe_ts = raw_ts.replace(':', '').replace('-', '').replace('T', '_').split('+')[0]
+                  else:
+                      now = datetime.datetime.now(datetime.timezone.utc)
+                      yyyy, mm, dd = now.strftime("%Y"), now.strftime("%m"), now.strftime("%d")
+                      safe_ts = now.strftime("%Y%m%d_%H%M%S")
+
+                  key = f"{LAYER_PREFIX}/{yyyy}/{mm}/{dd}/weather_{safe_ts}.json"
+                  s3.put_object(Bucket=RAW_BUCKET, Key=key, Body=json.dumps(record, ensure_ascii=False))
+                  return {"statusCode": 200}
+              except Exception as e:
+                  print(e); raise
+
+  IngestionSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: IngestionSchedule
+      ScheduleExpression: 'rate(15 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt IngestionFunction.Arn
+          Id: 'TargetFunctionV1'
+
+  IngestionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IngestionFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt IngestionSchedule.Arn
+
+  # ============================================================================
+  # 3. Transformation (Silver)
+  # ============================================================================
+  TransformationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: WeatherTransformation
+      Handler: index.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}'
+      Runtime: python3.12
+      Timeout: 30
+      Environment:
+        Variables:
+          BUCKET_NAME: !Sub 'meteo-project-${AWS::AccountId}-${AWS::Region}'
+      Code:
+        ZipFile: |
+          import csv, io, json, boto3, os
+          from urllib.parse import unquote_plus
+          DEST_BUCKET = os.environ.get("BUCKET_NAME")
+
+          def lambda_handler(event, context):
+              s3 = boto3.client("s3")
+              for rec in event.get("Records", []):
+                  src_bucket = rec["s3"]["bucket"]["name"]
+                  src_key = unquote_plus(rec["s3"]["object"]["key"])
+                  obj = s3.get_object(Bucket=src_bucket, Key=src_key)
+                  data = json.loads(obj["Body"].read().decode("utf-8"))
+                  row = {
+                      "station_id": data.get("id"),
+                      "timestamp_utc": data.get("heure_utc"),
+                      "temperature_c": data.get("temperature_en_degre_c"),
+                      "humidity": data.get("humidite"),
+                      "pressure": data.get("pression"),
+                      "rain_intensity": data.get("pluie"),
+                      "wind_speed": data.get("force_moyenne_du_vecteur_vent"),
+                      "wind_direction": data.get("direction_du_vecteur_vent_moyen"),
+                  }
+                  buf = io.StringIO()
+                  writer = csv.DictWriter(buf, fieldnames=list(row.keys()))
+                  writer.writeheader(); writer.writerow(row)
+                  dest_key = src_key.replace("bronze/", "silver/").replace(".json", ".csv")
+                  s3.put_object(Bucket=DEST_BUCKET, Key=dest_key, Body=buf.getvalue(), ContentType="text/csv")
+              return {"status": "ok"}
+
+  TransformationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TransformationFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 's3.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:s3:::meteo-project-${AWS::AccountId}-${AWS::Region}'
+
+  # ============================================================================
+  # 4. Glue & Catalog
+  # ============================================================================
+  GlueScriptUploader:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}'
+      Runtime: python3.12
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3, json, urllib3
+          def send_response(event, context, status, data={}):
+              http = urllib3.PoolManager()
+              response_body = json.dumps({
+                  'Status': status, 'Reason': 'Check CloudWatch Logs',
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'], 'Data': data
+              })
+              http.request('PUT', event['ResponseURL'], body=response_body, headers={'Content-Type': ''})
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  send_response(event, context, "SUCCESS"); return
+              try:
+                  bucket = event['ResourceProperties']['BucketName']
+                  s3 = boto3.client('s3')
+                  script = """
+          import sys, datetime
+          from awsglue.utils import getResolvedOptions
+          from pyspark.context import SparkContext
+          from awsglue.context import GlueContext
+          from awsglue.job import Job
+          from awsglue.dynamicframe import DynamicFrame
+
+          args = getResolvedOptions(sys.argv, ['JOB_NAME', 'BUCKET_NAME'])
+          sc = SparkContext(); glueContext = GlueContext(sc)
+          job = Job(glueContext); job.init(args['JOB_NAME'], args)
+          bucket_name = args['BUCKET_NAME']
+          source_path = f"s3://{bucket_name}/silver/"
+          dest_path = f"s3://{bucket_name}/gold/{datetime.datetime.now().strftime('%Y/%m/%d')}/"
+
+          try:
+              datasource0 = glueContext.create_dynamic_frame.from_options(
+                  format_options={"withHeader": True, "separator": ","},
+                  connection_type="s3", format="csv",
+                  connection_options={"paths": [source_path], "recurse": True}
+              )
+              if datasource0.count() > 0:
+                  df = datasource0.toDF().repartition(1)
+                  merged = DynamicFrame.fromDF(df, glueContext, "merged")
+                  glueContext.write_dynamic_frame.from_options(
+                      frame=merged, connection_type="s3",
+                      connection_options={"path": dest_path}, format="parquet"
+                  )
+          except Exception as e: print(e)
+          job.commit()
+                  """
+                  s3.put_object(Bucket=bucket, Key='scripts/daily_etl.py', Body=script)
+                  send_response(event, context, "SUCCESS")
+              except Exception as e:
+                  print(e); send_response(event, context, "FAILED")
+
+  UploadScriptAction:
+    Type: Custom::ScriptUpload
+    Properties:
+      ServiceToken: !GetAtt GlueScriptUploader.Arn
+      BucketName: !Ref DataBucket
+
+  DailyEtlJob:
+    Type: AWS::Glue::Job
+    DependsOn: UploadScriptAction
+    Properties:
+      Name: 'WeatherSilverToGold'
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}'
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${DataBucket}/scripts/daily_etl.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--BUCKET_NAME': !Ref DataBucket
+      GlueVersion: '4.0'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: 'meteo_db'
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: 'MeteoDataCrawler'
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}'
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${DataBucket}/silver/'
+          - Path: !Sub 's3://${DataBucket}/gold/'
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "DEPRECATE_IN_DATABASE"
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: MeteoWorkGroup
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${DataBucket}/athena-results/'
+
+  # ============================================================================
+  # 5. Dashboard (EC2) - FIXED SECTION
+  # ============================================================================
+  DashboardSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access for Streamlit
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  DashboardInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref LabRoleName
+
+  DashboardInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref DashboardInstanceProfile
+      SecurityGroupIds: 
+        - !Ref DashboardSecurityGroup
+      Tags:
+        - Key: Name
+          Value: MeteoDashboard
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # 日志记录
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          
+          dnf update -y
+          dnf install -y python3-pip git
+          
+          # 核心修复：安装依赖并处理冲突
+          pip3 install streamlit boto3 pandas fsspec s3fs --ignore-installed requests
+          
+          # 创建应用
+          cat <<EOF > /home/ec2-user/app.py
+          import streamlit as st
+          import boto3
+          import pandas as pd
+          import time
+          st.set_page_config(page_title="Toulouse Weather", layout="wide")
+          st.title("🌦️ Toulouse Real-Time Weather Dashboard")
+          ATHENA_DB = "meteo_db"
+          OUTPUT_LOC = "s3://${DataBucket}/athena-results/"
+          client = boto3.client('athena', region_name="${AWS::Region}")
+          
+          def run_query(query):
+              try:
+                  res = client.start_query_execution(
+                      QueryString=query,
+                      QueryExecutionContext={'Database': ATHENA_DB},
+                      ResultConfiguration={'OutputLocation': OUTPUT_LOC}
+                  )
+                  qid = res['QueryExecutionId']
+                  while True:
+                      s = client.get_query_execution(QueryExecutionId=qid)['QueryExecution']['Status']['State']
+                      if s in ['SUCCEEDED', 'FAILED', 'CANCELLED']: break
+                      time.sleep(1)
+                  if s == 'SUCCEEDED':
+                      return pd.read_csv(client.get_query_execution(QueryExecutionId=qid)['QueryExecution']['ResultConfiguration']['OutputLocation'])
+              except: return pd.DataFrame()
+
+          st.subheader("Latest Data")
+          if st.button('Refresh'): st.rerun()
+          try:
+              df = run_query('SELECT * FROM "meteo_db"."silver" ORDER BY timestamp_utc DESC LIMIT 50')
+              if df is not None and not df.empty:
+                  st.metric("Temperature", f"{df.iloc[0]['temperature_c']} °C")
+                  st.line_chart(df.set_index('timestamp_utc')[['temperature_c', 'humidity']])
+                  st.dataframe(df)
+              else: st.warning("Waiting for data/crawler...")
+          except Exception as e: st.error(e)
+          EOF
+          
+          # 权限与启动
+          chown ec2-user:ec2-user /home/ec2-user/app.py
+          sudo -u ec2-user nohup python3 -m streamlit run /home/ec2-user/app.py --server.port 8501 --server.address 0.0.0.0 > /home/ec2-user/streamlit.log 2>&1 &
+
+  # ============================================================================
+  # 6. Orchestration
+  # ============================================================================
+  DemoPipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: WeatherPipelineDemo
+      RoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${LabRoleName}'
+      DefinitionString: 
+        !Sub |
+          {
+            "StartAt": "IngestData",
+            "States": {
+              "IngestData": {
+                "Type": "Task",
+                "Resource": "${IngestionFunction.Arn}",
+                "Next": "Wait15s"
+              },
+              "Wait15s": { "Type": "Wait", "Seconds": 15, "Next": "RunGoldEtl" },
+              "RunGoldEtl": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Parameters": { "JobName": "${DailyEtlJob}" },
+                "Next": "RunCrawler"
+              },
+              "RunCrawler": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+                "Parameters": { "Name": "${GlueCrawler}" },
+                "End": true
+              }
+            }
+          }
+
+Outputs:
+  DashboardURL:
+    Description: "URL for the dashboard"
+    Value: !Sub "http://${DashboardInstance.PublicIp}:8501"
