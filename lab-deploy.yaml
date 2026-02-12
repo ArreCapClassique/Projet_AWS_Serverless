@@ -229,7 +229,7 @@ Resources:
         ScriptLocation: !Sub 's3://${DataBucket}/scripts/daily_etl.py'
         PythonVersion: '3'
       DefaultArguments:
-        '--BUCKET_NAME': !Ref DataBucket
+        --BUCKET_NAME: !Ref DataBucket
       GlueVersion: '4.0'
       WorkerType: G.1X
       NumberOfWorkers: 2
@@ -264,7 +264,7 @@ Resources:
           OutputLocation: !Sub 's3://${DataBucket}/athena-results/'
 
   # ============================================================================
-  # 5. Dashboard (EC2) - FIXED SECTION
+  # 5. Dashboard (EC2) - UPDATED WITH SCENARIOS & PARAMETERS
   # ============================================================================
   DashboardSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -300,23 +300,21 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          # 日志记录
           exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
           
           dnf update -y
           dnf install -y python3-pip git
-          
-          # 核心修复：安装依赖并处理冲突
           pip3 install streamlit boto3 pandas fsspec s3fs --ignore-installed requests
           
-          # 创建应用
           cat <<EOF > /home/ec2-user/app.py
           import streamlit as st
           import boto3
           import pandas as pd
           import time
-          st.set_page_config(page_title="Toulouse Weather", layout="wide")
-          st.title("🌦️ Toulouse Real-Time Weather Dashboard")
+
+          st.set_page_config(page_title="Toulouse Weather Analytics", layout="wide")
+          st.sidebar.title("Configuration")
+          
           ATHENA_DB = "meteo_db"
           OUTPUT_LOC = "s3://${DataBucket}/athena-results/"
           client = boto3.client('athena', region_name="${AWS::Region}")
@@ -330,26 +328,83 @@ Resources:
                   )
                   qid = res['QueryExecutionId']
                   while True:
-                      s = client.get_query_execution(QueryExecutionId=qid)['QueryExecution']['Status']['State']
-                      if s in ['SUCCEEDED', 'FAILED', 'CANCELLED']: break
-                      time.sleep(1)
-                  if s == 'SUCCEEDED':
-                      return pd.read_csv(client.get_query_execution(QueryExecutionId=qid)['QueryExecution']['ResultConfiguration']['OutputLocation'])
-              except: return pd.DataFrame()
+                      execution = client.get_query_execution(QueryExecutionId=qid)
+                      state = execution['QueryExecution']['Status']['State']
+                      if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+                          break
+                      time.sleep(0.5)
+                  
+                  if state == 'SUCCEEDED':
+                      results_path = execution['QueryExecution']['ResultConfiguration']['OutputLocation']
+                      return pd.read_csv(results_path)
+                  else:
+                      st.error(f"Athena query {state}")
+                      return None
+              except Exception as e:
+                  st.error(f"Error executing query: {e}")
+                  return None
 
-          st.subheader("Latest Data")
-          if st.button('Refresh'): st.rerun()
-          try:
-              df = run_query('SELECT * FROM "meteo_db"."silver" ORDER BY timestamp_utc DESC LIMIT 50')
-              if df is not None and not df.empty:
-                  st.metric("Temperature", f"{df.iloc[0]['temperature_c']} °C")
-                  st.line_chart(df.set_index('timestamp_utc')[['temperature_c', 'humidity']])
-                  st.dataframe(df)
-              else: st.warning("Waiting for data/crawler...")
-          except Exception as e: st.error(e)
+          st.title("🌦️ Toulouse Weather Medallion Analytics")
+
+          tabs = st.tabs(["Real-Time", "Extremes", "Daily Trends", "Wind Analysis", "Thermal Variation"])
+
+          with tabs[0]:
+              st.header("Scenario 1: Quality & Recent Data (Silver)")
+              limit = st.slider("Select sample size", 5, 50, 10, key="s1_limit")
+              q1 = f'SELECT station_id, timestamp_utc, temperature_c, humidity, wind_speed FROM "{ATHENA_DB}"."silver" ORDER BY timestamp_utc DESC LIMIT {limit}'
+              with st.spinner('Running Scenario 1...'):
+                  df1 = run_query(q1)
+                  if df1 is not None:
+                      st.dataframe(df1, use_container_width=True)
+
+          with tabs[1]:
+              st.header("Scenario 2: Extreme Temperature Alerts (Silver)")
+              threshold = st.number_input("Temperature Threshold (°C)", value=30.0)
+              q2 = f'SELECT timestamp_utc, temperature_c, wind_speed FROM "{ATHENA_DB}"."silver" WHERE CAST(temperature_c AS DOUBLE) > {threshold} ORDER BY CAST(temperature_c AS DOUBLE) DESC'
+              with st.spinner('Running Scenario 2...'):
+                  df2 = run_query(q2)
+                  if df2 is not None and not df2.empty:
+                      st.warning(f"Found {len(df2)} records above {threshold}°C")
+                      st.dataframe(df2, use_container_width=True)
+                  else:
+                      st.success(f"No temperatures detected above {threshold}°C.")
+
+          with tabs[2]:
+              st.header("Scenario 3: Daily Aggregates (Gold)")
+              q3 = f'SELECT SUBSTR(timestamp_utc, 1, 10) AS date_observation, ROUND(AVG(CAST(temperature_c AS DOUBLE)), 2) AS temp_moyenne, MAX(CAST(temperature_c AS DOUBLE)) AS temp_max, MIN(CAST(temperature_c AS DOUBLE)) AS temp_min FROM "{ATHENA_DB}"."gold" GROUP BY 1 ORDER BY 1 DESC'
+              with st.spinner('Running Scenario 3...'):
+                  df3 = run_query(q3)
+                  if df3 is not None:
+                      st.line_chart(df3.set_index('date_observation')[['temp_moyenne', 'temp_max', 'temp_min']])
+                      st.dataframe(df3, use_container_width=True)
+
+          with tabs[3]:
+              st.header("Scenario 4: Wind Potential (Gold)")
+              q4 = f"""SELECT 
+                          CASE 
+                              WHEN CAST(wind_speed AS DOUBLE) < 2 THEN 'Calme (<2m/s)'
+                              WHEN CAST(wind_speed AS DOUBLE) BETWEEN 2 AND 5 THEN 'Brise (2-5m/s)'
+                              ELSE 'Vent Fort (>5m/s)'
+                          END AS categorie_vent,
+                          COUNT(*) AS nombre_total_releves
+                        FROM "{ATHENA_DB}"."gold"
+                        GROUP BY 1 ORDER BY 2 DESC"""
+              with st.spinner('Running Scenario 4...'):
+                  df4 = run_query(q4)
+                  if df4 is not None:
+                      st.bar_chart(df4.set_index('categorie_vent'))
+                      st.write(df4)
+
+          with tabs[4]:
+              st.header("Scenario 5: Thermal Shock Detection (Silver)")
+              q5 = f'SELECT timestamp_utc, temperature_c, LAG(CAST(temperature_c AS DOUBLE), 1) OVER (ORDER BY timestamp_utc) AS temp_precedente, ROUND(CAST(temperature_c AS DOUBLE) - LAG(CAST(temperature_c AS DOUBLE), 1) OVER (ORDER BY timestamp_utc), 2) AS delta_thermique FROM "{ATHENA_DB}"."silver" ORDER BY timestamp_utc DESC'
+              with st.spinner('Running Scenario 5...'):
+                  df5 = run_query(q5)
+                  if df5 is not None:
+                      st.area_chart(df5.set_index('timestamp_utc')['delta_thermique'])
+                      st.dataframe(df5, use_container_width=True)
           EOF
           
-          # 权限与启动
           chown ec2-user:ec2-user /home/ec2-user/app.py
           sudo -u ec2-user nohup python3 -m streamlit run /home/ec2-user/app.py --server.port 8501 --server.address 0.0.0.0 > /home/ec2-user/streamlit.log 2>&1 &
 
